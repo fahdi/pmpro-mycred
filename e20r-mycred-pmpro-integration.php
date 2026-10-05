@@ -28,7 +28,7 @@ License:
 */
 
 defined( 'ABSPATH' ) || die( __( 'Cannot access plugin sources directly', 'e20r-mycred-pmpro-integration' ) );
-define( 'E20R_NPF_VER', '1.2.2' );
+define( 'E20R_NPF_VER', '1.2.3' );
 
 class e20rMyCredPmproIntegration {
 
@@ -85,9 +85,8 @@ class e20rMyCredPmproIntegration {
 		add_action( 'pmpro_subscription_payment_completed', array( $this, 'subscriptionPaymentComplete' ) );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_scripts' ) );
 
-		if ( WP_DEBUG ) {
-			add_action( 'wp', array( $this, 'runTestUpdateBilling' ) );
-		}
+		// Manual re-run of the renewal hook for an order: admin-only, nonce protected.
+		add_action( 'admin_post_e20rmcpmpi_test', array( $this, 'runTestUpdateBilling' ) );
 
 		if ( empty( $this->settings ) ) {
 			$this->settings = get_option( 'e20r_mycpmp', $this->defaultSettings() );
@@ -462,29 +461,40 @@ class e20rMyCredPmproIntegration {
     }
 
 	/**
-	 * Function used to test the environment (requires WP_DEBUG to be true).
+	 * Re-fire the "subscription payment completed" hook for a user's last successful order.
+	 *
+	 * Only reachable through admin-post.php?action=e20rmcpmpi_test&user_id=N&_wpnonce=...
+	 * by a logged-in administrator (previously: any anonymous visitor when WP_DEBUG was on).
 	 */
 	public function runTestUpdateBilling() {
 
-		if ( WP_DEBUG ) {
-			error_log( "e20rMCPMP: Run test environment?" );
-
-			$run_test = $this->util->_get_variable( 'e20rmcpmpi_test', false );
-
-			if ( false !== $run_test ) {
-
-				$order = new MemberOrder();
-				$order->getLastMemberOrder( 1, 'success' );
-
-				if ( WP_DEBUG && ! empty( $order->membership_id ) ) {
-					error_log( "Loaded order {$order->id} for {$order->user_id}" );
-				} else {
-					error_log( 'Order info: ' . print_r( $order, true ) );
-				}
-
-				do_action( 'pmpro_subscription_payment_completed', $order );
-			}
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( __( 'You are not allowed to do that.', 'e20r-mycred-pmpro-integration' ), '', array( 'response' => 403 ) );
 		}
+
+		check_admin_referer( 'e20rmcpmpi_test' );
+
+		if ( ! class_exists( 'MemberOrder' ) ) {
+			wp_die( __( 'Paid Memberships Pro is not active.', 'e20r-mycred-pmpro-integration' ) );
+		}
+
+		$user_id = isset( $_REQUEST['user_id'] ) ? absint( $_REQUEST['user_id'] ) : get_current_user_id();
+
+		$order = new MemberOrder();
+		$order->getLastMemberOrder( $user_id, 'success' );
+
+		if ( empty( $order->membership_id ) ) {
+			wp_die( __( 'No successful order found for that user.', 'e20r-mycred-pmpro-integration' ) );
+		}
+
+		if ( WP_DEBUG ) {
+			error_log( "e20rMCPMP: Re-running payment completed hook for order {$order->id} (user {$order->user_id})" );
+		}
+
+		do_action( 'pmpro_subscription_payment_completed', $order );
+
+		wp_safe_redirect( wp_get_referer() ? wp_get_referer() : admin_url() );
+		exit;
 	}
 
 	/**
