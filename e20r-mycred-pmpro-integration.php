@@ -63,6 +63,21 @@ class e20rMyCredPmproIntegration {
 	private $license_descr = null;
 
 	/**
+	 * @var array $settings Plugin settings (per level)
+	 */
+	private $settings = array();
+
+	/**
+	 * @var e20rLicense $license
+	 */
+	private $license = null;
+
+	/**
+	 * @var string Meta key holding the list of order codes points were already granted for
+	 */
+	const AWARDED_META_KEY = 'e20r_mycpmp_awarded_orders';
+
+	/**
 	 * e20rMyCredPmproIntegration constructor.
 	 */
 	public function __construct() {
@@ -205,7 +220,14 @@ class e20rMyCredPmproIntegration {
 				$rk_arr = explode( '_', $key );
 
 				$real_key = str_replace( '-', '_', $rk_arr[ ( count( $rk_arr ) - 1 ) ] );
-				$this->saveSetting( $real_key, sanitize_text_field( stripslashes_deep( $_REQUEST[ $key ] ) ), $level_id );
+				$clean    = sanitize_text_field( stripslashes_deep( $_REQUEST[ $key ] ) );
+
+				// Point amounts are whole, non-negative numbers
+				if ( in_array( $real_key, array( 'renewal_points', 'max_level_points' ), true ) ) {
+					$clean = absint( $clean );
+				}
+
+				$this->saveSetting( $real_key, $clean, $level_id );
 			}
 		}
 	}
@@ -279,7 +301,7 @@ class e20rMyCredPmproIntegration {
                     <label for="e20r-mycpmp_renewal-points"><?php printf( __( "Renewal %s", "e20r-mycred-pmpro-integration" ), strtolower( $plural ) ); ?></label>
                 </th>
                 <td class="e20r-settings-cell">
-                    <input type="number"
+                    <input type="number" min="0"
                            value="<?php esc_attr_e( $this->getSetting( 'renewal_points', $level_id ) ); ?>"
                            name="e20r-mycpmp_renewal-points" id="e20r-mycpmp_renewal-points">
                     <small><?php printf( __( "Number of %s to award when payment renews.", "e20r-mycred-pmpro-integration" ), strtolower( $plural ) ); ?></small>
@@ -290,7 +312,7 @@ class e20rMyCredPmproIntegration {
                     <label for="e20r-mycpmp_max-level-points"><?php printf( __( "%s balance (max)", "e20r-mycred-pmpro-integration" ), $singular ); ?></label>
                 </th>
                 <td class="e20r-settings-cell">
-                    <input type="number" size="20" name="e20r-mycpmp_max-level-points"
+                    <input type="number" min="0" size="20" name="e20r-mycpmp_max-level-points"
                            id="e20r-mycpmp_max-level-points"
                            value="<?php echo !empty( $max_level_points ) ? esc_attr( $max_level_points ) : 0; ?>">
                     <small><?php printf( __( "Use %d to grant 'unlimited' points. Use '0' to signify that the membership level isn't capped", "e20r-mycred-pmpro-integration" ), $max_balance ); ?></small>
@@ -360,13 +382,22 @@ class e20rMyCredPmproIntegration {
 			return null;
 		}
 
-		$score = $this->getSetting( 'renewal_points', $order->membership_id );
+		$score = intval( $this->getSetting( 'renewal_points', $order->membership_id ) );
 
 		// No score defined
-		if ( empty( $score ) ) {
+		if ( $score <= 0 ) {
 			error_log( "No score defined for this level" );
 
 			return null;
+		}
+
+		// Already granted points for this order (checkout + IPN, IPN/webhook retries, etc)
+		if ( $this->alreadyAwarded( $order ) ) {
+			if ( WP_DEBUG ) {
+				error_log( "Points already granted for order {$this->orderKey( $order )}, skipping" );
+			}
+
+			return false;
 		}
 
 		$point_type = $this->getSetting( 'point_type', $order->membership_id );
@@ -375,30 +406,32 @@ class e20rMyCredPmproIntegration {
 		$level = pmpro_getLevel( $order->membership_id );
 
 		// Add the points to the mycred account for the user and add a notification message.
-		if ( ! empty( $level->id ) || false === $mycred->exclude_user( $order->user_id ) ) {
+		if ( ! empty( $level->id ) && false === $mycred->exclude_user( $order->user_id ) ) {
 
 			$point_description = $this->getSetting( 'reference_text', $order->membership_id );
-			$max_level_balance = $this->getSetting( 'max_level_points', $order->membership_id );
+			$max_level_balance = intval( $this->getSetting( 'max_level_points', $order->membership_id ) );
 
 			$current_balance = $mycred->get_users_balance( $order->user_id );
 
 			$level_reference = apply_filters( 'e20r-mycred-pmpro-default_type', 'Points for Renewal' );
-			$max_balance     = apply_filters( 'e20r-mycred-pmpro-max-balance', '999999' );
+			$max_balance     = intval( apply_filters( 'e20r-mycred-pmpro-max-balance', 999999 ) );
 
-			$new_balance = $current_balance + $score;
+			$score = self::clampScore( $score, $current_balance, $max_level_balance, $max_balance );
 
-			// Keep the
-			if ( ! empty( $max_level_balance ) && ( $new_balance > $max_level_balance ) ) {
-				$score += ( $max_level_balance - $new_balance );
-			} else if ( ! empty( $max_level_balance ) && $max_level_balance == $max_balance ) {
-				$score += ( $max_balance - $current_balance );
+			// Never deduct points (or no-op) on a renewal: the member is at/above the cap already
+			if ( $score <= 0 ) {
+				if ( WP_DEBUG ) {
+					error_log( "User {$order->user_id} is at the balance cap for level {$order->membership_id}, nothing to add" );
+				}
+
+				return false;
 			}
 
 			if ( WP_DEBUG ) {
 				error_log( "Adding {$score} points to user {$order->user_id}" );
 			}
 
-			if ( ! empty( $score ) && true === $mycred->add_creds(
+			if ( true === $mycred->add_creds(
 					$level_reference,
 					$order->user_id,
 					$score,
@@ -407,7 +440,9 @@ class e20rMyCredPmproIntegration {
 					$point_type )
 			) {
 
-				if ( ( $score > 0 ) && ($current_balance + $score <= $max_level_balance) && function_exists( 'mycred_add_new_notice' ) ) {
+				$this->markAwarded( $order );
+
+				if ( function_exists( 'mycred_add_new_notice' ) ) {
 
 					// Level warrants unlimited points
 					if ( $max_level_balance == $max_balance ) {
@@ -446,6 +481,110 @@ class e20rMyCredPmproIntegration {
 		}
 
 		return true;
+	}
+
+	/**
+	 * Compute the number of points to grant, honoring the per-level cap and the "unlimited" sentinel.
+	 *
+	 * Never returns a negative number, so the caller can never turn a renewal into a deduction.
+	 *
+	 * @param int $score             Configured renewal points for the level
+	 * @param int $current_balance   The member's current balance
+	 * @param int $max_level_balance Per-level cap (0 = uncapped, == $max_balance means "unlimited")
+	 * @param int $max_balance       The "unlimited" sentinel value
+	 *
+	 * @return int
+	 */
+	public static function clampScore( $score, $current_balance, $max_level_balance, $max_balance ) {
+
+		$score             = intval( $score );
+		$current_balance   = intval( $current_balance );
+		$max_level_balance = intval( $max_level_balance );
+		$max_balance       = intval( $max_balance );
+
+		if ( $score <= 0 ) {
+			return 0;
+		}
+
+		if ( empty( $max_level_balance ) ) {
+			return $score;
+		}
+
+		// Level warrants "unlimited" points: top the member up to the sentinel
+		if ( $max_level_balance === $max_balance ) {
+			return max( 0, $max_balance - $current_balance );
+		}
+
+		// Capped level: only grant what fits under the cap
+		return max( 0, min( $score, $max_level_balance - $current_balance ) );
+	}
+
+	/**
+	 * Unique key for an order (code is the public, stable identifier in PMPro)
+	 *
+	 * @param MemberOrder|stdClass $order
+	 *
+	 * @return string|null
+	 */
+	private function orderKey( $order ) {
+
+		if ( ! empty( $order->code ) ) {
+			return (string) $order->code;
+		}
+
+		if ( ! empty( $order->id ) ) {
+			return 'id:' . $order->id;
+		}
+
+		return null;
+	}
+
+	/**
+	 * Whether points have already been granted for this order
+	 *
+	 * @param MemberOrder|stdClass $order
+	 *
+	 * @return bool
+	 */
+	private function alreadyAwarded( $order ) {
+
+		$key = $this->orderKey( $order );
+
+		if ( null === $key ) {
+			// Nothing to de-duplicate on; let the award happen
+			return false;
+		}
+
+		$awarded = get_user_meta( $order->user_id, self::AWARDED_META_KEY, true );
+
+		return is_array( $awarded ) && in_array( $key, $awarded, true );
+	}
+
+	/**
+	 * Remember that points were granted for this order
+	 *
+	 * @param MemberOrder|stdClass $order
+	 */
+	private function markAwarded( $order ) {
+
+		$key = $this->orderKey( $order );
+
+		if ( null === $key ) {
+			return;
+		}
+
+		$awarded = get_user_meta( $order->user_id, self::AWARDED_META_KEY, true );
+
+		if ( ! is_array( $awarded ) ) {
+			$awarded = array();
+		}
+
+		$awarded[] = $key;
+
+		// Keep the list bounded (an order is only ever re-sent within days of its creation)
+		$awarded = array_slice( array_unique( $awarded ), - 100 );
+
+		update_user_meta( $order->user_id, self::AWARDED_META_KEY, $awarded );
 	}
 
 	/**
